@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use futures_util::{StreamExt as _, stream};
@@ -40,6 +40,8 @@ enum Removal {
 struct Plan {
     removal: Option<Removal>,
     strikes: Vec<(i32, String)>,
+    /// Coalesce each role; revocation wins when rules disagree.
+    roles: BTreeMap<i64, (bool, String)>,
     failures: usize,
 }
 
@@ -59,6 +61,15 @@ impl Plan {
                 }
                 Ok(MessageActionOutcome::Strike(reason)) => {
                     self.strikes.push((result.action_id, reason))
+                }
+                Ok(MessageActionOutcome::GiveRole { role_id, reason }) => {
+                    self.roles.entry(role_id).or_insert((true, reason));
+                }
+                Ok(MessageActionOutcome::RevokeRole { role_id, reason }) => {
+                    let change = self.roles.entry(role_id).or_insert((false, reason.clone()));
+                    if change.0 {
+                        *change = (false, reason);
+                    }
                 }
                 Ok(MessageActionOutcome::Ignore) => {}
                 Err(_) => self.failures += 1,
@@ -138,6 +149,7 @@ impl Moderation {
             self.notify_strikes(channel_id, user_id, Some(message_id), count),
         );
         plan.failures += feedback_failures;
+        self.apply_roles(guild_id, user_id, &mut plan).await;
         self.apply_removal(guild_id, user_id, &mut plan).await;
         ensure!(
             plan.failures == 0,
@@ -171,6 +183,7 @@ impl Moderation {
             self.notify_strikes(channel_id, user_id, None, 1),
         );
         plan.failures += feedback_failures;
+        self.apply_roles(guild_id, user_id, &mut plan).await;
         self.apply_removal(guild_id, user_id, &mut plan).await;
         Ok((id, plan.failures))
     }
@@ -254,6 +267,43 @@ impl Moderation {
                     plan.failures += 1;
                     tracing::error!(strike_id, ?error, "Failed to process strike actions");
                 }
+            }
+        }
+    }
+
+    async fn apply_roles(
+        &self,
+        guild_id: Id<GuildMarker>,
+        user_id: Id<UserMarker>,
+        plan: &mut Plan,
+    ) {
+        for (role_id, (give, reason)) in std::mem::take(&mut plan.roles) {
+            let result = async {
+                let role = discord_id(role_id)?;
+                ensure!(
+                    role_id != snowflake(guild_id)?,
+                    "cannot change the @everyone role"
+                );
+                let reason: String = reason.chars().take(512).collect();
+                // Discord checks Manage Roles, managed roles, and the bot's live
+                // role hierarchy. Change only this role, preserving other roles.
+                if give {
+                    self.http
+                        .add_guild_member_role(guild_id, user_id, role)
+                        .reason(&reason)
+                        .await?;
+                } else {
+                    self.http
+                        .remove_guild_member_role(guild_id, user_id, role)
+                        .reason(&reason)
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                plan.failures += 1;
+                tracing::error!(%guild_id, %user_id, role_id, give, ?error, "Failed to change member role");
             }
         }
     }

@@ -74,6 +74,7 @@ fn message_context(base: i64, codes: &[(i32, &str)]) -> MessageContext {
                 id: *id,
                 guild_id: base,
                 only_channels: None,
+                role_id: None,
                 question: format!("message rule {id}"),
                 code: Some(format!("messages => {code}")),
             })
@@ -86,6 +87,118 @@ fn jev() -> typesafe::Client {
         .base_url("http://127.0.0.1:1/v1")
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn role_changes_coalesce_and_discord_failures_do_not_discard_other_actions() -> Result<()> {
+    let pool = PgPool::connect_lazy("postgres://localhost:1/unused")?;
+    for failed in [false, true] {
+        let (http, requests) = discord_server(3, move |headers| {
+            if failed && headers.starts_with("put /api/v10/guilds/100/members/102/roles/700 ") {
+                (403, json!({"code":50013,"message":"Missing Permissions"}))
+            } else {
+                (204, json!({}))
+            }
+        })?;
+        let moderation = Moderation::new(pool.clone(), http, jev(), Id::new(600));
+        let mut input = message_context(
+            100,
+            &[
+                (1, "'GIVE_ROLE'"),
+                (2, "'GIVE_ROLE'"),
+                (3, "'GIVE_ROLE'"),
+                (4, "'REVOKE_ROLE'"),
+                (5, "'GIVE_ROLE'"),
+                (6, "'KICK'"),
+            ],
+        );
+        for (action, role_id) in input.actions.iter_mut().zip([700, 700, 701, 701, 701]) {
+            action.role_id = Some(role_id);
+        }
+        assert_eq!(moderation.process_message(input).await.is_err(), failed);
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[0]
+                .headers
+                .starts_with("put /api/v10/guilds/100/members/102/roles/700 ")
+        );
+        assert!(
+            requests[1]
+                .headers
+                .starts_with("delete /api/v10/guilds/100/members/102/roles/701 ")
+        );
+        assert!(
+            requests[2]
+                .headers
+                .starts_with("delete /api/v10/guilds/100/members/102 ")
+        );
+        for request in requests {
+            assert!(request.headers.contains("x-audit-log-reason:"));
+            assert!(request.body.is_null());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL; see README.md"]
+async fn manual_and_automatic_strikes_apply_configured_role_changes() -> Result<()> {
+    let pool = test_pool(4).await?;
+    let base = 9_650_000_000_000_000_i64 + i64::from(std::process::id()) * 100_000;
+    for (index, manual) in [true, false].into_iter().enumerate() {
+        let guild = base + index as i64 * 100;
+        for (role, code) in [
+            (700, "strikes => 'GIVE_ROLE'"),
+            (701, "strikes => 'REVOKE_ROLE'"),
+        ] {
+            let id = rule(&pool, guild, None, code).await?;
+            sqlx::query("UPDATE strike_actions SET role_id = $1 WHERE id = $2")
+                .bind(role as i64)
+                .bind(id)
+                .execute(&pool)
+                .await?;
+        }
+        let (http, requests) =
+            discord_with_hierarchy(if manual { 6 } else { 7 }, [204, 200, 204], guild, 600)?;
+        let moderation = Moderation::new(pool.clone(), http, jev(), Id::new(600));
+        if manual {
+            let (_, failures) = moderation
+                .record_manual(&NewStrike {
+                    guild_id: guild,
+                    channel_id: guild + 1,
+                    user_id: guild + 2,
+                    moderator_id: 600,
+                    reason: "test role escalation".into(),
+                    source: StrikeSource::Interaction(guild + 10),
+                })
+                .await?;
+            assert_eq!(failures, 0);
+        } else {
+            moderation
+                .process_message(message_context(guild, &[(1, "'STRIKE'")]))
+                .await?;
+        }
+        let requests = requests.join().unwrap();
+        assert!(requests.iter().any(|r| r.headers.starts_with(&format!(
+            "put /api/v10/guilds/{guild}/members/{}/roles/700 ",
+            guild + 2
+        ))));
+        assert!(requests.iter().any(|r| r.headers.starts_with(&format!(
+            "delete /api/v10/guilds/{guild}/members/{}/roles/701 ",
+            guild + 2
+        ))));
+        assert_feedback(
+            &requests,
+            guild + 1,
+            guild + 2,
+            (!manual).then_some(guild + 4),
+            1,
+        );
+    }
+    cleanup(&pool, &[base, base + 100]).await?;
+    pool.close().await;
+    Ok(())
 }
 
 async fn test_pool(size: u32) -> Result<PgPool> {

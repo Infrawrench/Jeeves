@@ -226,6 +226,7 @@ fn pages_show_rule_types_and_scopes_without_ids_and_fit_long_unicode() {
                 code: i % 3 == 0,
                 question: question.clone(),
                 only_channels: Some(vec![i64::MAX; 50]),
+                role_id: Some(i64::MAX),
             })
             .collect();
         let page = Page {
@@ -242,11 +243,13 @@ fn pages_show_rule_types_and_scopes_without_ids_and_fit_long_unicode() {
         };
         let (_, embeds, components) = render(page, "");
         assert_eq!(embeds[0].title.as_deref(), Some("Server actions"));
-        assert_eq!(embeds[0].fields.len(), size as usize * 2);
-        for fields in embeds[0].fields.as_chunks::<2>().0 {
+        assert_eq!(embeds[0].fields.len(), size as usize * 3);
+        for fields in embeds[0].fields.as_chunks::<3>().0 {
             assert!(!fields[0].name.contains('#'));
             assert!(fields[1].value.contains("and 40 more"));
             assert!(fields[0].value.chars().count() <= 1000);
+            assert_eq!(fields[2].name, "Role");
+            assert_eq!(fields[2].value, format!("<@&{}>", i64::MAX));
         }
         let _ = EmbedBuilder::from(embeds[0].clone()).validate().unwrap();
         let Component::ActionRow(navigation) = &components[0] else {
@@ -293,6 +296,7 @@ fn pages_show_rule_types_and_scopes_without_ids_and_fit_long_unicode() {
             code,
             question: "rule".into(),
             only_channels: None,
+            role_id: None,
         };
         assert_eq!(action.kind(), expected);
         assert_eq!(action.channels(), "All channels");

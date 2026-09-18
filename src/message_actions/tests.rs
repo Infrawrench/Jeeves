@@ -37,6 +37,7 @@ pub(super) fn context(ids: &[i32]) -> MessageContext {
                 id: *id,
                 guild_id: 100,
                 only_channels: None,
+                role_id: None,
                 question: format!("question-{id}"),
                 code: Some("messages => null".into()),
             })
@@ -321,6 +322,76 @@ async fn jev_failure_is_reported_without_discarding_other_action_results() -> Re
     Ok(())
 }
 
+pub(crate) fn role_score_response(strike: bool, level: usize) -> Value {
+    let criteria = action_criteria(strike, Some(9007199254740993));
+    let legend: serde_json::Map<_, _> = criteria
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (index.to_string(), json!(name)))
+        .collect();
+    let probabilities: serde_json::Map<_, _> = criteria
+        .iter()
+        .enumerate()
+        .map(|(index, _)| (index.to_string(), json!(usize::from(index == level))))
+        .collect();
+    json!({"model": "jev-test", "usage": {}, "answers": {"answer": {
+        "type": "score", "score": level, "confidence": 1,
+        "legend": legend, "probabilities": probabilities,
+    }}})
+}
+
+#[tokio::test]
+async fn message_role_outcomes_use_the_configured_role_in_both_modes() -> Result<()> {
+    for (level, code, expected) in [
+        (
+            3,
+            "'GIVE_ROLE'",
+            MessageActionOutcome::GiveRole {
+                role_id: 9007199254740993,
+                reason: "question-7".into(),
+            },
+        ),
+        (
+            4,
+            "'REVOKE_ROLE'",
+            MessageActionOutcome::RevokeRole {
+                role_id: 9007199254740993,
+                reason: "question-7".into(),
+            },
+        ),
+        (5, "null", MessageActionOutcome::Ignore),
+    ] {
+        let (jev, request) = jev_response(200, role_score_response(false, level))?;
+        let mut input = context(&[7]);
+        input.actions[0].code = None;
+        input.actions[0].role_id = Some(9007199254740993);
+        let report = process_message(input, jev).await;
+        assert_eq!(*report.results[0].result.as_ref().unwrap(), expected);
+        let request = request.join().unwrap();
+        assert_eq!(
+            request["questions"]["answer"]["criteria"],
+            json!([
+                "ban",
+                "kick",
+                "strike",
+                "give role",
+                "revoke role",
+                "no action"
+            ])
+        );
+
+        let mut input = context(&[7]);
+        input.actions[0].code = Some(format!("messages => {code}"));
+        input.actions[0].role_id = Some(9007199254740993);
+        let jev = typesafe::Client::builder("test-key")
+            .base_url("http://127.0.0.1:1/v1")
+            .build()?;
+        let report = process_message(input, jev).await;
+        assert_eq!(*report.results[0].result.as_ref().unwrap(), expected);
+    }
+    Ok(())
+}
+
 #[test]
 fn jev_history_fits_exactly_and_reserves_each_question_and_json_overhead() -> Result<()> {
     let input = context(&[]);
@@ -336,7 +407,7 @@ fn jev_history_fits_exactly_and_reserves_each_question_and_json_overhead() -> Re
     older.images[0].description_error = Some("Unavailable: \"画像\"\n".into());
     context.history.insert(0, older);
     let rule = "Strike for \"spam\"\n日本語";
-    let question = moderation_question(rule)?;
+    let question = moderation_question(rule, None)?;
     let small = jev_state(&context, &question)?;
     assert_eq!(small["history"].as_array().unwrap().len(), 2);
     let remaining = JEV_CONTEXT_BUDGET
@@ -356,7 +427,7 @@ fn jev_history_fits_exactly_and_reserves_each_question_and_json_overhead() -> Re
     assert_eq!(exact["current_message"]["images"], json!(context.images));
 
     // The same message history fits differently for a longer rule.
-    let longer_question = moderation_question(&format!("{rule}!"))?;
+    let longer_question = moderation_question(&format!("{rule}!"), None)?;
     assert_eq!(
         jev_state(&context, &longer_question)?["history"]
             .as_array()
@@ -382,7 +453,7 @@ fn jev_preserves_oversized_current_message_and_images_without_history() -> Resul
     };
     context.message.content = "Current 🦀\n".repeat(4_000);
     context.images[0].description = Some("Image text\n".repeat(4_000));
-    let question = moderation_question("Strike for spam")?;
+    let question = moderation_question("Strike for spam", None)?;
     let state = jev_state(&context, &question)?;
     assert_eq!(state["current_message"]["id"], "300");
     assert_eq!(state["current_message"]["content"], context.message.content);

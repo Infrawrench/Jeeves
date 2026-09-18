@@ -6,7 +6,7 @@ Discord moderation rules in plain English. Jeeves uses Jev to interpret messages
 strike history, Gemini to describe image attachments and generate rules that need
 computation, and PostgreSQL to keep track of messages, rules, and strikes.
 
-**[Invite Jeeves to your server](https://discord.com/oauth2/authorize?client_id=1550283057125392566&scope=bot%20applications.commands&permissions=76806&integration_type=0)**
+**[Invite Jeeves to your server](https://discord.com/oauth2/authorize?client_id=1550283057125392566&scope=bot%20applications.commands&permissions=268512262&integration_type=0)**
 
 Built with Rust, Twilight, Tokio, SQLx, and an embedded QuickJS runtime.
 
@@ -23,8 +23,10 @@ Built with Rust, Twilight, Tokio, SQLx, and an embedded QuickJS runtime.
    ```
 
 The invite requests **View Channels**, **Send Messages**, **Manage Messages**,
-**Read Message History**, **Kick Members**, and **Ban Members**. Manage Messages lets
+**Read Message History**, **Kick Members**, **Ban Members**, and **Manage Roles**. Manage Messages lets
 Jeeves delete messages that receive strikes; Send Messages lets it notify the member.
+Manage Roles lets it give and revoke roles below its highest role. Existing installs
+need that permission enabled to use role actions.
 
 Rules belong to the server where they are created. There are no built-in moderation
 rules or automatic three-strike bans: add an escalation rule if you want one.
@@ -63,6 +65,8 @@ is no type selector or separate channel option.
 /addaction question:Strike users who send the same message 3 times within 30 seconds.
 /addaction question:Strike users for spam in #general and #chat.
 /addaction question:Ban a user when they have at least 3 strikes.
+/addaction question:Give the Helpful role to users who post helpful answers.
+/addaction question:Revoke <@&123456789012345678> when a user has at least 3 strikes.
 ```
 
 Jev classifies each rule using named choices with descriptions:
@@ -74,6 +78,7 @@ Jev classifies each rule using named choices with descriptions:
 | `strike_binary` | Jev interprets a member's new strike and earlier strikes. |
 | `strike_code` | Gemini generates JavaScript for computations such as strike thresholds. |
 | `contains_channels` | Gemini separates the channel restrictions from the rule, then Jev classifies the remaining statement. |
+| `contains_roles` | Gemini extracts the target role, Jeeves resolves it, then Jev classifies the rule's trigger and evaluation mode. |
 | `none_of_the_above` | The request is rejected without saving a rule. |
 
 Rules apply to every channel in the server unless they name specific channels.
@@ -82,12 +87,23 @@ against the server's message channels and active threads before saving. Unknown
 channels, exclusions, categories, and unsupported scopes are rejected. A selected
 parent channel does not automatically include its threads.
 
-Message rules can produce **ban**, **kick**, **strike**, or **no action**. A matching
-Jev message rule with no stated punishment defaults to a strike. Earlier messages
+Message rules can produce **ban**, **kick**, **strike**, **give role**, **revoke role**,
+or **no action**. A matching Jev message rule with no stated punishment defaults to a strike. Earlier messages
 provide context; a violation in history alone should not punish a later message's
-author. Strike rules can ban, kick, or take no action; they cannot create more strikes.
+author. Strike rules can ban, kick, give or revoke a role, or take no action; they
+cannot create more strikes.
 
-Use `/manageactions` to review the saved statement, type, and channel scope. Generated
+For a role outcome, use a Discord role mention or its complete name, including spaces.
+Names are matched case-insensitively; duplicate names require a mention. Jev selects
+`contains_roles` when the rule requests a role change; only then does Gemini extract
+the target role. Channel restrictions are extracted first when both are present.
+Jeeves resolves the role against the server's roles before saving its ID,
+so a later rename does not change the target. Unknown roles, `@everyone`, and managed
+roles are rejected. Each rule can change one specific role for the message author or
+struck member; use separate rules for additional outcomes. Current role membership
+is not part of the rule evaluation context.
+
+Use `/manageactions` to review the saved statement, type, channel scope, and target role. Generated
 code is checked for syntax and function shape before saving, but that check does not
 prove that every input will produce the intended decision. Unsupported rules and
 failed classification or generation save nothing.
@@ -98,6 +114,10 @@ Every matching strike outcome is recorded, even when another rule also requests 
 kick or ban. Both automatic strikes and `/strike` run the configured strike rules.
 Jeeves combines their outcomes with the message rules: **ban takes precedence over
 kick**, and duplicate removal requests collapse into one. All strikes remain recorded.
+Role changes also collapse by role, with revocation taking precedence over giving the
+same role. They run before kicks or bans, and a failed role change does not prevent
+other roles or removals from being applied. Discord enforces Manage Roles and the bot's
+role hierarchy when each change is requested.
 
 Before recording a strike, Jeeves checks current roles. The recipient's highest role
 must be below the bot's highest role. The server owner and Jeeves itself are protected;
@@ -111,8 +131,8 @@ the strike or preventing escalation.
 
 Retries of an interaction or the same message/rule pair do not create duplicate
 strikes. Strikes persist independently of message retention. Removing a strike stops
-it from counting toward future rules; removing strikes or rules does not undo bans
-or kicks. A rule already loaded by an in-progress task may finish after its removal.
+it from counting toward future rules; removing strikes or rules does not undo bans,
+kicks, or role changes. A rule already loaded by an in-progress task may finish after its removal.
 
 ## Self-hosting
 
@@ -208,6 +228,8 @@ creates `messages`, `strikes`, `message_actions`, and `strike_actions`. The data
 role needs permission to apply migrations. This is a fresh-install baseline:
 installations that used the earlier separate migrations need their migration history
 rebased before using it.
+The [role action migration](migrations/20260918120000_action_roles.sql) adds an optional
+target role ID to both rule tables and is applied automatically on startup.
 
 ## Message context and storage
 
@@ -249,7 +271,7 @@ do not prevent message storage or rule evaluation. Edits reuse successful descri
 for unchanged attachments. GIFs, videos, stickers, and linked previews are not described.
 
 For Jev evaluation, message text, channel history, image descriptions, or strike history
-are sent to TypeSafe. Image bytes, channel-scope extraction requests, and code-generation
+are sent to TypeSafe. Image bytes, channel-scope and role extraction requests, and code-generation
 requests go to the configured Gemini backend. Provider-side retention is separate from
 Jeeves' 500-message database limit. Rule processing and image work are not durably queued
 for replay after a restart.
@@ -276,7 +298,7 @@ Message fields are `id`, `guild_id`, `channel_id`, `author_id`, `content`, `time
 `edited_timestamp`, and `images`. Discord IDs are strings; timestamps are Unix
 milliseconds. `edited_timestamp` may be null. Image entries include attachment ID,
 URL, MIME type, description, and description error. Return `"BAN"`, `"KICK"`,
-`"STRIKE"`, or `null`.
+`"STRIKE"`, `"GIVE_ROLE"`, `"REVOKE_ROLE"`, or `null`.
 
 Strike rules receive that member's earlier strikes across the server, followed by
 the new strike exactly once:
@@ -288,8 +310,13 @@ the new strike exactly once:
 Strike fields are `id`, `guild_id`, `channel_id`, `user_id`, `moderator_id`, `reason`,
 `created_at`, `interaction_id`, `source_message_id`, and `source_action_id`. Strike
 and Discord IDs are strings; `source_action_id` is an integer or null. Source IDs can
-be null, and `created_at` is Unix milliseconds. Return `"BAN"`, `"KICK"`, or `null`;
+be null, and `created_at` is Unix milliseconds. Return `"BAN"`, `"KICK"`,
+`"GIVE_ROLE"`, `"REVOKE_ROLE"`, or `null`;
 `"STRIKE"` is rejected to prevent recursion.
+
+Role results use the target role ID saved by `/addaction`. Scripts cannot select a
+role dynamically or return a role name or ID; role results without a configured
+target role fail that rule.
 
 Scripts run in fresh QuickJS runtimes with no filesystem, network, environment, or
 host API bindings. Limits are one second of execution, 64 MiB of JavaScript memory,

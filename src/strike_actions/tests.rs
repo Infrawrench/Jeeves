@@ -1,6 +1,53 @@
 use super::*;
 use crate::message_actions::{ActionError, tests::jev_response};
 
+#[tokio::test]
+async fn strike_role_outcomes_use_the_configured_role_in_both_modes() -> Result<()> {
+    for (level, code, expected) in [
+        (
+            2,
+            "'GIVE_ROLE'",
+            MessageActionOutcome::GiveRole {
+                role_id: 9007199254740993,
+                reason: "rule-0".into(),
+            },
+        ),
+        (
+            3,
+            "'REVOKE_ROLE'",
+            MessageActionOutcome::RevokeRole {
+                role_id: 9007199254740993,
+                reason: "rule-0".into(),
+            },
+        ),
+        (4, "null", MessageActionOutcome::Ignore),
+    ] {
+        let (client, request) = jev_response(
+            200,
+            crate::message_actions::tests::role_score_response(true, level),
+        )?;
+        let mut input = context(&[None]);
+        input.actions[0].role_id = Some(9007199254740993);
+        let report = process_strike(input, client).await;
+        assert_eq!(*report.results[0].result.as_ref().unwrap(), expected);
+        let request = request.join().unwrap();
+        assert_eq!(
+            request["questions"]["answer"]["criteria"],
+            json!(["ban", "kick", "give role", "revoke role", "no action"])
+        );
+
+        let code = format!("strikes => {code}");
+        let mut input = context(&[Some(&code)]);
+        input.actions[0].role_id = Some(9007199254740993);
+        let client = typesafe::Client::builder("test-key")
+            .base_url("http://127.0.0.1:1/v1")
+            .build()?;
+        let report = process_strike(input, client).await;
+        assert_eq!(*report.results[0].result.as_ref().unwrap(), expected);
+    }
+    Ok(())
+}
+
 fn strike(id: i64) -> StoredStrike {
     StoredStrike {
         id,
@@ -27,6 +74,7 @@ fn context(codes: &[Option<&str>]) -> StrikeContext {
                 id: id as i32,
                 guild_id: 100,
                 only_channels: None,
+                role_id: None,
                 question: format!("rule-{id}"),
                 code: code.map(str::to_owned),
             })

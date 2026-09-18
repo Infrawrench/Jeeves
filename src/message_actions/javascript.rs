@@ -22,8 +22,9 @@ pub(super) async fn execute(
     context: Arc<ActionContext>,
     code: String,
     reason: String,
+    role_id: Option<i64>,
 ) -> Result<MessageActionOutcome> {
-    execute_with_input(code, reason, move || {
+    execute_with_input(code, reason, role_id, move || {
         Ok(serde_json::to_vec(&message_values(&context))?)
     })
     .await
@@ -32,21 +33,22 @@ pub(super) async fn execute(
 pub(crate) async fn execute_with_input<F>(
     code: String,
     reason: String,
+    role_id: Option<i64>,
     input: F,
 ) -> Result<MessageActionOutcome>
 where
     F: FnOnce() -> Result<Vec<u8>> + Send + 'static,
 {
-    run_worker(code, move || Ok(Some((input()?, reason)))).await
+    run_worker(code, role_id, move || Ok(Some((input()?, reason)))).await
 }
 
 /// Check a rule's syntax and synchronous, single-argument function shape in a
 /// bounded runtime. Does not call its body or prove its behavior for every input.
 pub async fn validate(code: String) -> Result<()> {
-    run_worker(code, || Ok(None)).await.map(|_| ())
+    run_worker(code, None, || Ok(None)).await.map(|_| ())
 }
 
-async fn run_worker<F>(code: String, input: F) -> Result<MessageActionOutcome>
+async fn run_worker<F>(code: String, role_id: Option<i64>, input: F) -> Result<MessageActionOutcome>
 where
     F: FnOnce() -> Result<Option<(Vec<u8>, String)>> + Send + 'static,
 {
@@ -61,7 +63,7 @@ where
     // gateway, storage, or other action tasks. Hold the slot until it really exits.
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        run(input()?, &code, cancelled)
+        run(input()?, &code, role_id, cancelled)
     })
     .await
     .context("JavaScript worker failed")?
@@ -70,6 +72,7 @@ where
 fn run(
     input: Option<(Vec<u8>, String)>,
     code: &str,
+    role_id: Option<i64>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<MessageActionOutcome> {
     let deadline = Instant::now() + EXECUTION_LIMIT;
@@ -118,13 +121,15 @@ fn run(
             return Ok(MessageActionOutcome::Ignore);
         }
         let Some(result) = result.as_string() else {
-            bail!("JavaScript rule must return \"BAN\", \"KICK\", \"STRIKE\", or null");
+            bail!("JavaScript rule must return \"BAN\", \"KICK\", \"STRIKE\", \"GIVE_ROLE\", \"REVOKE_ROLE\", or null");
         };
         Ok(match result.to_string()?.as_str() {
             "BAN" => MessageActionOutcome::Ban(reason),
             "KICK" => MessageActionOutcome::Kick(reason),
             "STRIKE" => MessageActionOutcome::Strike(reason),
-            _ => bail!("JavaScript rule must return \"BAN\", \"KICK\", \"STRIKE\", or null"),
+            "GIVE_ROLE" => MessageActionOutcome::role(role_id, true, reason)?,
+            "REVOKE_ROLE" => MessageActionOutcome::role(role_id, false, reason)?,
+            _ => bail!("JavaScript rule must return \"BAN\", \"KICK\", \"STRIKE\", \"GIVE_ROLE\", \"REVOKE_ROLE\", or null"),
         })
     });
     ensure!(

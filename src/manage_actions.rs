@@ -147,6 +147,7 @@ struct Action {
     question: String,
     code: bool,
     only_channels: Option<Vec<i64>>,
+    role_id: Option<i64>,
 }
 
 impl Action {
@@ -195,8 +196,8 @@ impl Page {
 
 fn page_size(max_question_bytes: i32) -> i64 {
     // Twilight counts UTF-8 bytes in the aggregate embed limit. Allow room for
-    // type labels, ten channel mentions per rule, and the footer.
-    5.min(5800 / (i64::from(max_question_bytes) + 360)).max(1)
+    // type labels, ten channel mentions and one role per rule, and the footer.
+    5.min(5800 / (i64::from(max_question_bytes) + 400)).max(1)
 }
 
 async fn load_page(pool: &PgPool, mut request: Request) -> Result<Page> {
@@ -233,11 +234,11 @@ async fn load_page(pool: &PgPool, mut request: Request) -> Result<Page> {
     let size = page_size(max_bytes);
     request.page = request.page.clamp(0, (total - 1).max(0) / size);
     let actions = sqlx::query_as(
-        "SELECT id, message, question, code, only_channels FROM (
-             SELECT id, TRUE AS message, question, code IS NOT NULL AS code, only_channels
+        "SELECT id, message, question, code, only_channels, role_id FROM (
+             SELECT id, TRUE AS message, question, code IS NOT NULL AS code, only_channels, role_id
              FROM message_actions WHERE guild_id = $1 AND id <= $2
              UNION ALL
-             SELECT id, FALSE AS message, question, code IS NOT NULL AS code, only_channels
+             SELECT id, FALSE AS message, question, code IS NOT NULL AS code, only_channels, role_id
              FROM strike_actions WHERE guild_id = $1 AND id <= $3
          ) AS actions ORDER BY message DESC, id DESC LIMIT $4 OFFSET $5",
     )
@@ -388,6 +389,9 @@ fn render(page: Page, notice: &str) -> (String, Vec<Embed>, Vec<Component>) {
                 question,
             ))
             .field(EmbedFieldBuilder::new("Channels", action.channels()));
+        if let Some(role_id) = action.role_id {
+            embed = embed.field(EmbedFieldBuilder::new("Role", format!("<@&{role_id}>")));
+        }
         removals = removals.component(button(
             request,
             Operation::Remove {

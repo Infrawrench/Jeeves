@@ -21,6 +21,24 @@ fn client() -> typesafe::Client {
 }
 
 #[tokio::test]
+async fn role_scripts_cannot_choose_a_role_from_message_content() {
+    let report = process(&[
+        "messages => 'GIVE_ROLE'",
+        "messages => 'REVOKE_ROLE'",
+        "messages => ({action: 'GIVE_ROLE', role_id: '123'})",
+        "messages => 'GIVE_ROLE:123'",
+        "messages => null",
+    ])
+    .await;
+    assert_eq!((report.succeeded(), report.failed()), (1, 4));
+    for result in &report.results[..2] {
+        assert!(
+            matches!(&result.result, Err(ActionError::Handler(error)) if error.to_string().contains("no configured role"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn javascript_returns_all_four_outcomes_in_action_order() {
     let report = process(&[
         r#"function rule(messages) { return "BAN"; }"#,

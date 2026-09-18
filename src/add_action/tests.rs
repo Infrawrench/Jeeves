@@ -30,6 +30,236 @@ fn unused_jev() -> typesafe::Client {
         .unwrap()
 }
 
+fn role(id: u64, name: &str, managed: bool) -> Role {
+    serde_json::from_value(json!({
+        "id": id.to_string(), "name": name, "managed": managed,
+        "position": 1, "color": 0, "colors": {"primary_color": 0},
+        "hoist": false, "mentionable": false, "permissions": "0", "flags": 0,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn role_names_and_mentions_resolve_only_existing_unmanaged_guild_roles() {
+    let roles = vec![
+        role(100, "@everyone", false),
+        role(200, "Trusted Member", false),
+        role(201, "Muted", false),
+        role(202, "Integration", true),
+        role(203, "Muted", false),
+        role(204, "Équipe", false),
+    ];
+    for reference in [
+        "Trusted Member",
+        " trusted member ",
+        "@Trusted Member",
+        "<@&200>",
+    ] {
+        assert_eq!(resolve_role(100, reference, &roles).unwrap(), 200);
+    }
+    assert_eq!(resolve_role(100, "<@&201>", &roles).unwrap(), 201);
+    assert_eq!(resolve_role(100, "éQUIPE", &roles).unwrap(), 204);
+    for reference in [
+        "Missing",
+        "<@&999>",
+        "<@200>",
+        "<#200>",
+        "<@&0>",
+        "<@&invalid>",
+        "Muted",
+        "@everyone",
+        "<@&100>",
+        "Integration",
+        "<@&202>",
+    ] {
+        let error = resolve_role(100, reference, &roles).unwrap_err();
+        assert!(
+            error.downcast_ref::<RoleRuleError>().is_some(),
+            "{reference}"
+        );
+        assert!(error_message(&error).contains("No action was saved"));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable TEST_DATABASE_URL; see README.md"]
+async fn role_rules_save_and_reload_in_all_modes_and_reject_invalid_roles() -> Result<()> {
+    let pool = crate::db::connect(
+        crate::config::database_options(&std::env::var("TEST_DATABASE_URL")?)?,
+        4,
+    )
+    .await?;
+    let guild = 7_600_000_000_000_000_i64 + i64::from(fastrand::u32(..));
+    for (index, (kind, scoped)) in [
+        ActionKind::MessageBinary,
+        ActionKind::MessageCode,
+        ActionKind::StrikeBinary,
+        ActionKind::StrikeCode,
+    ]
+    .into_iter()
+    .flat_map(|kind| [(kind, false), (kind, true)])
+    .enumerate()
+    {
+        let action = NewAction {
+            guild_id: guild,
+            interaction_id: guild + index as i64,
+            question: if scoped {
+                "Revoke Trusted Member after spam in #general"
+            } else {
+                "Revoke Trusted Member after spam"
+            }
+            .into(),
+        };
+        let mut responses = Vec::new();
+        if scoped {
+            responses.push((200, choice_response(ActionKind::ContainsChannels)));
+        }
+        responses.extend([
+            (200, choice_response(ActionKind::ContainsRoles)),
+            (200, resolved_role_response(kind)),
+        ]);
+        let (jev, requests) = jev_responses(responses)?;
+        let saved = save_with_services(
+            &pool,
+            &jev,
+            &action,
+            |mode, question| async move {
+                assert_eq!(Some(mode), kind.code_mode());
+                assert_eq!(question, "Revoke Trusted Member after spam");
+                Ok("events => 'REVOKE_ROLE'".into())
+            },
+            |_, _| async {
+                assert!(
+                    scoped,
+                    "rules without channel restrictions must not split channels"
+                );
+                Ok(ScopedRule {
+                    question: "Revoke Trusted Member after spam".into(),
+                    channels: vec![200],
+                })
+            },
+            |guild_id, question| async move {
+                assert_eq!(guild_id, guild);
+                assert_eq!(question, "Revoke Trusted Member after spam");
+                Ok(Some(resolve_role(
+                    guild,
+                    "Trusted Member",
+                    &[role(300, "Trusted Member", false)],
+                )?))
+            },
+        )
+        .await?
+        .unwrap();
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), if scoped { 3 } else { 2 });
+        let classified = requests.last().unwrap();
+        assert_eq!(classified["state"], "Revoke Trusted Member after spam");
+        assert!(
+            classified["questions"]["answer"]["criteria"]
+                .get("contains_roles")
+                .is_none()
+        );
+        assert!(
+            requests[0]["questions"]["answer"]["criteria"]
+                .get("contains_roles")
+                .is_some()
+        );
+        assert_eq!(saved.kind, kind);
+        assert_eq!(saved.role_id, Some(300));
+        assert_eq!(saved.only_channels, scoped.then_some(vec![200]));
+        let query = if kind.is_message() {
+            "SELECT id, guild_id, question, code, only_channels, role_id FROM message_actions WHERE id = $1"
+        } else {
+            "SELECT id, guild_id, question, code, only_channels, role_id FROM strike_actions WHERE id = $1"
+        };
+        let stored: jeeves::message_actions::MessageAction = sqlx::query_as(query)
+            .bind(saved.id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(stored.role_id, Some(300));
+        assert_eq!(stored.code.is_some(), kind.code_mode().is_some());
+        let retry = save_with_services(
+            &pool,
+            &unused_jev(),
+            &action,
+            |_, _| async { panic!("must not regenerate") },
+            |_, _| async { panic!("must not split again") },
+            |_, _| async { panic!("must keep saved role even if renamed") },
+        )
+        .await?;
+        assert_eq!(retry, Some(saved));
+    }
+    let action = NewAction {
+        guild_id: guild,
+        interaction_id: guild + 10,
+        question: "Give Missing for helpful messages".into(),
+    };
+    let (jev, request) = jev_response(200, choice_response(ActionKind::ContainsRoles))?;
+    let error = save_with_services(
+        &pool,
+        &jev,
+        &action,
+        |_, _| async { panic!("must not generate") },
+        |_, _| async { panic!("must not split") },
+        |guild, _| async move { resolve_role(guild, "Missing", &[]).map(Some) },
+    )
+    .await
+    .unwrap_err();
+    request.join().unwrap();
+    assert!(error_message(&error).contains("could not be found"));
+    assert_eq!(existing(&pool, &action).await?, None);
+    let (jev, request) = jev_response(200, choice_response(ActionKind::ContainsRoles))?;
+    let error = save_with_services(
+        &pool,
+        &jev,
+        &action,
+        |_, _| async { panic!("must not generate without a role") },
+        |_, _| async { panic!("must not split channels") },
+        |_, _| async { Ok(None) },
+    )
+    .await
+    .unwrap_err();
+    request.join().unwrap();
+    assert!(error_message(&error).contains("couldn't identify the role"));
+    assert_eq!(existing(&pool, &action).await?, None);
+
+    // A failed final classification must never save a partially resolved rule.
+    for kind in [
+        ActionKind::NoneOfTheAbove,
+        ActionKind::ContainsChannels,
+        ActionKind::ContainsRoles,
+    ] {
+        let (jev, requests) = jev_responses(vec![
+            (200, choice_response(ActionKind::ContainsRoles)),
+            (200, resolved_role_response(kind)),
+        ])?;
+        let result = save_with_services(
+            &pool,
+            &jev,
+            &action,
+            |_, _| async { panic!("must not generate unsupported rules") },
+            |_, _| async { panic!("must not split channels") },
+            |_, _| async { Ok(Some(300)) },
+        )
+        .await;
+        if kind == ActionKind::NoneOfTheAbove {
+            assert_eq!(result?, None);
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(existing(&pool, &action).await?, None);
+        requests.join().unwrap();
+    }
+    for query in [
+        "DELETE FROM message_actions WHERE guild_id=$1",
+        "DELETE FROM strike_actions WHERE guild_id=$1",
+    ] {
+        sqlx::query(query).bind(guild).execute(&pool).await?;
+    }
+    pool.close().await;
+    Ok(())
+}
+
 #[test]
 fn accepts_only_question_and_validates_permissions_and_scope() {
     let options = options();
@@ -92,21 +322,28 @@ async fn jev_classifies_with_key_description_choices() -> Result<()> {
         ActionKind::StrikeBinary,
         ActionKind::StrikeCode,
         ActionKind::ContainsChannels,
+        ActionKind::ContainsRoles,
         ActionKind::NoneOfTheAbove,
     ] {
         let (jev, request) = jev_response(200, choice_response(kind))?;
-        assert_eq!(classify(&jev, "Ban after 3 strikes").await?, kind);
+        assert_eq!(classify(&jev, "Ban after 3 strikes", false).await?, kind);
         let request = request.join().unwrap();
         assert_eq!(request["state"], "Ban after 3 strikes");
         let question = &request["questions"]["answer"];
         assert_eq!(question["type"], "choice");
         let descriptions = question["criteria"].as_object().unwrap();
-        assert_eq!(descriptions.len(), 6);
+        assert_eq!(descriptions.len(), 7);
         assert!(
             descriptions["contains_channels"]
                 .as_str()
                 .unwrap()
                 .contains("WHERE")
+        );
+        assert!(
+            descriptions["contains_roles"]
+                .as_str()
+                .unwrap()
+                .contains("OUTCOME")
         );
         for key in ["message_binary", "strike_binary"] {
             assert!(
@@ -141,7 +378,7 @@ async fn jev_classifies_with_key_description_choices() -> Result<()> {
         ),
     ] {
         let (jev, request) = jev_response(status, body)?;
-        assert!(classify(&jev, "Ban after 3 strikes").await.is_err());
+        assert!(classify(&jev, "Ban after 3 strikes", false).await.is_err());
         request.join().unwrap();
     }
     Ok(())
@@ -280,9 +517,18 @@ async fn classifies_saves_rejects_failures_and_deduplicates_across_types() -> Re
 }
 
 fn choice_response(kind: ActionKind) -> Value {
-    let mut probabilities = json!({"message_binary": 0, "message_code": 0, "strike_binary": 0, "strike_code": 0, "contains_channels": 0, "none_of_the_above": 0});
+    let mut probabilities = json!({"message_binary": 0, "message_code": 0, "strike_binary": 0, "strike_code": 0, "contains_channels": 0, "contains_roles": 0, "none_of_the_above": 0});
     probabilities[kind.name()] = json!(1);
     json!({"model": "jev-test", "usage": {}, "answers": {"answer": {"type": "choice", "choice": kind, "probabilities": probabilities, "confidence": 1}}})
+}
+
+fn resolved_role_response(kind: ActionKind) -> Value {
+    let mut response = choice_response(kind);
+    response["answers"]["answer"]["probabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("contains_roles");
+    response
 }
 
 fn jev_response(status: u16, body: Value) -> Result<(typesafe::Client, thread::JoinHandle<Value>)> {
