@@ -23,6 +23,20 @@ def kubectl(*args, document=None):
     return result.stdout
 
 
+def read_web_manifest():
+    # kubectl emits one JSON object per resource, even for a YAML List.
+    remaining = kubectl(
+        "create", "--dry-run=client", "--validate=false", "-f", "deploy/web.yaml", "-o", "json"
+    ).strip()
+    decoder = json.JSONDecoder()
+    items = []
+    while remaining:
+        item, end = decoder.raw_decode(remaining)
+        items.extend(item["items"] if item.get("kind") == "List" else [item])
+        remaining = remaining[end:].lstrip()
+    return {"apiVersion": "v1", "kind": "List", "items": items}
+
+
 def main():
     image = os.environ["JEEVES_IMAGE"]
     if not re.fullmatch(r"[a-z0-9./_-]+@sha256:[a-f0-9]{64}", image):
@@ -62,9 +76,7 @@ def main():
             sys.exit("PUBLIC_URL must be an HTTPS origin without a port or path.")
         if not re.fullmatch(r"[a-z0-9_]{1,25}", values["TWITCH_BOT_LOGIN"]):
             sys.exit("TWITCH_BOT_LOGIN must be a lowercase Twitch login.")
-        web = json.loads(kubectl(
-            "create", "--dry-run=client", "--validate=false", "-f", "deploy/web.yaml", "-o", "json"
-        ))
+        web = read_web_manifest()
         ingress = next(item for item in web["items"] if item["kind"] == "Ingress")
         ingress["spec"]["rules"][0]["host"] = origin.hostname
         ingress["spec"]["tls"][0]["hosts"] = [origin.hostname]
