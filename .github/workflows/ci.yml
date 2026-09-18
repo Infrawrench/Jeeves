@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.98.0"
+
+jobs:
+  checks:
+    name: Rust and PostgreSQL checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: jeeves
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: jeeves_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jeeves -d jeeves_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Cache Rust dependencies and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run unit and documentation tests
+        run: cargo test --locked
+      - name: Run database integration tests
+        env:
+          TEST_DATABASE_URL: postgres://jeeves:ci-only-password@localhost:5432/jeeves_test?sslmode=disable
+        run: cargo test --locked --bin jeeves -- --ignored --test-threads=1
+
+  iam:
+    name: Google Cloud IAM
+    needs: checks
+    if: >-
+      github.repository == 'Infrawrench/Jeeves' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Authenticate through Workload Identity Federation
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 300s
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Confirm authentication
+        run: echo "Google Cloud issued a short-lived access token to the Jeeves CI identity."

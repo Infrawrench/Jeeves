@@ -1,0 +1,12 @@
+/target
+/certs/
+/.projects/
+/.neon
+.DS_Store
+
+.env
+.env.*
+!.env.example
+
+# Temporary credentials written by google-github-actions/auth.
+gha-creds-*.json

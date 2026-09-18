@@ -1,0 +1,34 @@
+[package]
+name = "jeeves"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Discord moderation rules in plain English, powered by Jev and Gemini"
+license = "MIT"
+repository = "https://github.com/Infrawrench/Jeeves"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+dotenvy = "0.15"
+fastrand = "2"
+futures-util = "0.3"
+google-cloud-auth = { version = "1.16", default-features = false }
+http = "1"
+httpdate = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+rquickjs = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "macros", "migrate", "time", "json"] }
+time = "0.3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+twilight-gateway = { version = "0.17", default-features = false, features = ["rustls-native-roots", "zlib"] }
+twilight-http = { version = "0.17", default-features = false, features = ["rustls-native-roots", "decompression"] }
+twilight-model = "0.17"
+twilight-util = { version = "0.17", features = ["builder"] }
+url = "2"
