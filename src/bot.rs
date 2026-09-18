@@ -21,6 +21,7 @@ pub async fn run(
     pool: PgPool,
     gemini: crate::gemini::Gemini,
     jev: jeeves::typesafe::Client,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let http = Arc::new(Client::new(token.clone()));
     let application = http
@@ -48,7 +49,14 @@ pub async fn run(
     ));
     let mut ingestion_finished = false;
     let mut handlers = JoinSet::new();
-    let shutdown = shutdown_signal();
+    let shutdown = async move {
+        while !*stop.borrow_and_update() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    };
     tokio::pin!(shutdown);
 
     let result = loop {
@@ -183,7 +191,7 @@ fn log_handler_result(result: Result<Result<()>, tokio::task::JoinError>) {
     }
 }
 
-async fn shutdown_signal() -> Result<()> {
+pub(crate) async fn shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
         let mut terminate =

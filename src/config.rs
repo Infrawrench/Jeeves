@@ -6,7 +6,8 @@ use url::Url;
 
 // Do not derive Debug: this contains credentials.
 pub struct Config {
-    pub discord_token: String,
+    pub discord_token: Option<String>,
+    pub twitch: Option<crate::twitch::Config>,
     pub gemini_model: String,
     pub gemini_backend: GeminiBackend,
     pub database: PgConnectOptions,
@@ -20,7 +21,12 @@ pub enum GeminiBackend {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let discord_token = required("DISCORD_TOKEN")?;
+        let discord_token = optional("DISCORD_TOKEN")?;
+        let twitch = crate::twitch::Config::from_env()?;
+        ensure!(
+            discord_token.is_some() || twitch.is_some(),
+            "Configure DISCORD_TOKEN or Twitch; see .env.example"
+        );
         let gemini_model = optional("GEMINI_MODEL")?.unwrap_or_else(|| "gemini-3.7-flash".into());
         let gemini_backend = match optional("GEMINI_BACKEND")?
             .as_deref()
@@ -50,6 +56,7 @@ impl Config {
 
         Ok(Self {
             discord_token,
+            twitch,
             gemini_model,
             gemini_backend,
             database,
@@ -81,11 +88,11 @@ pub(crate) fn database_options(value: &str) -> Result<PgConnectOptions> {
     Ok(options)
 }
 
-fn required(name: &str) -> Result<String> {
+pub(crate) fn required(name: &str) -> Result<String> {
     optional(name)?.with_context(|| format!("{name} is required; see .env.example"))
 }
 
-fn optional(name: &str) -> Result<Option<String>> {
+pub(crate) fn optional(name: &str) -> Result<Option<String>> {
     match env::var(name) {
         Ok(value) if value.trim().is_empty() => Ok(None),
         Ok(value) => Ok(Some(value)),

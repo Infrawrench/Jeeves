@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: jeeves
+      namespace: jeeves
+    spec:
+      selector:
+        app: jeeves
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+  - apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: jeeves
+      namespace: jeeves
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt-prod
+        # OAuth callbacks contain a short-lived code; keep it out of access logs.
+        nginx.ingress.kubernetes.io/enable-access-log: "false"
+        nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    spec:
+      ingressClassName: nginx
+      tls:
+        - hosts: [jeeves.infrawrench.com]
+          secretName: jeeves-tls
+      rules:
+        - host: jeeves.infrawrench.com
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: jeeves
+                    port:
+                      name: http

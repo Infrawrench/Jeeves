@@ -18,6 +18,12 @@ metadata:
   name: jeeves-deployer
   namespace: jeeves
 rules:
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, create, patch, update]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, create, patch, update]
   - apiGroups: [apps]
     resources: [deployments]
     verbs: [get, list, watch, create, patch, update]

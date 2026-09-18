@@ -156,6 +156,11 @@ jobs:
         env:
           JEEVES_IMAGE: ${{ vars.AR_REGISTRY }}/jeeves@${{ needs.build.outputs.digest }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_ACCESS_TOKEN: ${{ secrets.TWITCH_ACCESS_TOKEN }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          TWITCH_BOT_LOGIN: ${{ secrets.TWITCH_BOT_LOGIN }}
+          PUBLIC_URL: ${{ secrets.PUBLIC_URL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DATABASE_MAX_CONNECTIONS: ${{ secrets.DATABASE_MAX_CONNECTIONS }}
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}

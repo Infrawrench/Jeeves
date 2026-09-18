@@ -2,13 +2,16 @@
 
 [![CI](https://github.com/Infrawrench/Jeeves/actions/workflows/ci.yml/badge.svg)](https://github.com/Infrawrench/Jeeves/actions/workflows/ci.yml)
 
-Discord moderation rules in plain English. Jeeves uses Jev to interpret messages and
+Discord and Twitch moderation rules in plain English. Jeeves uses Jev to interpret messages and
 strike history, Gemini to describe image attachments and generate rules that need
 computation, and PostgreSQL to keep track of messages, rules, and strikes.
 
 **[Invite Jeeves to your server](https://discord.com/oauth2/authorize?client_id=1550283057125392566&scope=bot%20applications.commands&permissions=268512262&integration_type=0)**
 
 Built with Rust, Twilight, Tokio, SQLx, and an embedded QuickJS runtime.
+
+For Twitch chat, see [Twitch setup and commands](#twitch-setup-and-commands).
+Discord and Twitch can run independently or together.
 
 ## Get started
 
@@ -56,6 +59,8 @@ reopen the command to include them. Controls belong to the person who opened the
 and admin permissions are checked again on every click.
 
 ## Writing rules
+
+This section describes Discord rules. Twitch uses the commands in the next section.
 
 Describe the condition and the outcome. Jeeves figures out how to evaluate it; there
 is no type selector or separate channel option.
@@ -108,7 +113,123 @@ code is checked for syntax and function shape before saving, but that check does
 prove that every input will produce the intended decision. Unsupported rules and
 failed classification or generation save nothing.
 
-## How strikes work
+## Twitch setup and commands
+
+Jeeves receives Twitch chat through EventSub WebSockets and applies moderation through
+the Twitch API. No public webhook endpoint is needed. Each channel has its own rules,
+message history, and strikes, separate from Discord and every other Twitch channel.
+
+1. Register an application in the [Twitch developer console](https://dev.twitch.tv/console/apps).
+2. Choose a **Confidential** client and register `https://your-host/auth/twitch/callback`
+   as its redirect URL. Set `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `TWITCH_BOT_LOGIN`,
+   and `PUBLIC_URL=https://your-host` in the server's runtime secrets.
+3. Deploy Jeeves with the PostgreSQL, TypeSafe, and Gemini settings used for Discord.
+   Its HTTP service listens on port 8080 behind an HTTPS ingress. Visit
+   `PUBLIC_URL/auth/twitch` once and authorize **the configured bot account**.
+   Jeeves requests `user:read:chat`, `user:write:chat`, `moderator:manage:banned_users`,
+   `moderator:manage:chat_messages`, and `user:read:moderated_channels`.
+   The bot connects automatically after authorization; no restart is needed.
+
+The hosted instance is at [jeeves.infrawrench.com](https://jeeves.infrawrench.com).
+Broadcasters do not need a local server, application credentials, or an OAuth callback.
+For manual development, you can instead omit the hosted settings and supply
+`TWITCH_CLIENT_ID` plus a raw `TWITCH_ACCESS_TOKEN` with all five scopes.
+
+Broadcasters can now add their own channels without changing server configuration:
+
+1. In **your own channel**, run `/mod bot_login`, replacing `bot_login` with the bot account's login.
+2. In **the bot account's Twitch chat**, send `!join`.
+3. Back in your channel, use `!addaction` to configure moderation rules.
+
+Send `!leave` in the bot's chat to stop moderating your channel. `!jeeves join` and
+`!jeeves leave` are aliases; `!jeeves help` in the bot's chat explains enrollment.
+No channel argument is accepted: each person can register or remove only their own
+channel, and Jeeves verifies its moderator access before registering it.
+Registrations are stored in PostgreSQL, survive restarts, and connect or disconnect
+within a few seconds without restarting other channels. Leaving cancels queued and
+in-flight work; already submitted moderation requests may still finish. Existing rules
+and strikes are kept so rejoining restores them.
+
+Up to 20 channels can register per bot account. The bot always listens in its own chat
+for enrollment commands; other lobby messages are not archived or evaluated as rules.
+`TWITCH_CHANNELS` is no longer used; previously configured channels should enroll with
+`!join`. Only the bot credentials remain in environment variables.
+
+For Twitch-only operation, leave `DISCORD_TOKEN` unset. Both platforms use Jev and Gemini
+for rule creation. To run both, configure both sets of platform credentials. Twitch tokens are
+validated at startup and hourly. Hosted authorization stores access and refresh tokens
+in PostgreSQL and renews access after a 401, serializing refreshes to preserve rotated
+credentials. Protect database access and backups as secrets. Revoked authorization
+requires another visit to the setup page; Discord and the page remain available.
+Manual `TWITCH_ACCESS_TOKEN` credentials require replacement and restart when expired.
+Authorization or subscription failures are logged;
+a fatal bot failure shuts down the process so a supervisor can restart it.
+
+The broadcaster and channel moderators can configure rules in chat:
+
+```text
+!addaction Strike users who post unsolicited advertising.
+!addaction Delete messages containing spoilers for today's game.
+!addaction Time out users for ten minutes for targeted harassment.
+!addaction Ban users who threaten violence.
+!addaction Time out users for ten minutes when they have at least three strikes.
+!addaction Ban users when they have at least five strikes.
+!jeeves rules
+!jeeves remove 12
+!jeeves forgive 34
+```
+
+`!addaction` takes a complete plain-English rule, like Discord's `/addaction`.
+`!jeeves addaction` is an alias. Jev classifies the trigger and Gemini extracts the
+condition, outcome, timeout duration, and optional strike threshold. The extracted
+values are checked before saving; unsupported rules and model failures save nothing
+and receive an explanation in chat. A message rule with no stated punishment defaults
+to a strike. Timeout rules must state a duration. The saved rule is confirmed in chat.
+The older `!jeeves add <outcome> <condition>` and `!jeeves escalate` syntax still works.
+
+For message rules, Jev decides whether the current message satisfies the condition,
+using recent channel history for context. Strike thresholds are counted in PostgreSQL.
+Timeouts accept 1–1,209,600 seconds. Rules apply only to the channel where they were added.
+The broadcaster, moderators, and bot are protected from automatic moderation. Messages
+relayed from other channels in Shared Chat are ignored, including their commands.
+
+Twitch strikes are persistent: each matching strike rule records one strike and attempts
+to delete the offending message. Multiple rules can record strikes from the same message,
+with one deletion and one chat notice. Rules such as “Ban users after three strikes”
+create an optional threshold evaluated whenever new strikes are recorded.
+There is no default threshold. Bans take
+precedence over timeouts; the longest requested timeout wins. Strikes remain recorded
+even if Twitch rejects a deletion, timeout, ban, or notice.
+
+Anyone can use `!jeeves strikes` to view their own active strikes **publicly in chat**.
+`!jeeves strikes <after-id>` shows the next entry; `!jeeves rules <after-id>` similarly
+pages through rules. Moderators can remove a strike with `!jeeves forgive <strike-id>`;
+it stops counting toward future thresholds without undoing earlier timeouts or bans.
+Removed strike sources remain recorded to prevent duplicate deliveries restoring them.
+`!jeeves help` lists commands. Viewer command responses are limited to one per channel
+every three seconds.
+
+Twitch currently supports semantic message rules and minimum total strike-count thresholds.
+Rules requiring message arithmetic, strike time windows/subsets, or multiple outcomes
+are rejected during creation rather than simplified.
+Discord's generated JavaScript rules, roles, slash commands, manual strikes, and image
+descriptions are not available on Twitch. Use separate rules for separate outcomes.
+
+Jeeves retains the newest 500 Twitch messages per channel and removes stored messages
+on chat deletion/clear events. Strikes survive that retention. Jev receives current
+message text plus as much newest-first history as fits its conservative context budget.
+New rule descriptions are also sent to Jev and Gemini for classification and extraction.
+Each channel processes events in order while the WebSocket runs independently. Duplicate
+deliveries are suppressed for at least 24 hours; strike source deduplication is permanent.
+Queued events and external moderation effects are not durably replayed after a crash,
+and Twitch does not backfill chat missed during a disconnect. API failures are logged
+without retrying moderation effects. A full channel queue stops the bot visibly.
+
+The integration follows Twitch's [chat authorization](https://dev.twitch.tv/docs/chat/authenticating/),
+[EventSub WebSocket](https://dev.twitch.tv/docs/eventsub/handling-websocket-events/), and
+[moderation API](https://dev.twitch.tv/docs/api/reference/#ban-user) documentation.
+
+## How Discord strikes work
 
 Every matching strike outcome is recorded, even when another rule also requests a
 kick or ban. Both automatic strikes and `/strike` run the configured strike rules.
@@ -136,8 +257,9 @@ kicks, or role changes. A rule already loaded by an in-progress task may finish 
 
 ## Self-hosting
 
-You need Rust **1.94+**, PostgreSQL, a Discord bot token, a TypeSafe API key, and Gemini
-access through either Vertex AI or the Gemini Developer API. Docker Compose can run
+You need Rust **1.94+**, PostgreSQL, a TypeSafe API key, and credentials for Discord
+and/or Twitch. Both platforms need Gemini access through either Vertex AI or the Gemini
+Developer API. Docker Compose can run
 the development database.
 
 ### Discord
@@ -180,7 +302,12 @@ To use the Gemini Developer API instead, set `GEMINI_BACKEND=developer` and supp
 
 | Variable | Purpose / default |
 | --- | --- |
-| `DISCORD_TOKEN` | Required bot token, without the `Bot ` prefix. |
+| `DISCORD_TOKEN` | Discord bot token, without the `Bot ` prefix. Optional when Twitch is configured. |
+| `TWITCH_CLIENT_ID` | Twitch application client ID; required when Twitch is enabled. |
+| `TWITCH_CLIENT_SECRET` | Application secret for hosted authorization and token renewal. |
+| `TWITCH_BOT_LOGIN` | Lowercase bot login; only this account can complete hosted authorization. |
+| `PUBLIC_URL` | HTTPS origin for the hosted page, e.g. `https://jeeves.infrawrench.com`. |
+| `TWITCH_ACCESS_TOKEN` | Alternative manual bot token with the five scopes above; no prefix, no automatic refresh. |
 | `DATABASE_URL` | Required PostgreSQL URL, including any SSL options. |
 | `DATABASE_MAX_CONNECTIONS` | Connection pool size; defaults to `5`. |
 | `TYPESAFE_API_KEY` | Required for Jev rule classification and evaluation. |
@@ -231,7 +358,7 @@ rebased before using it.
 The [role action migration](migrations/20260918120000_action_roles.sql) adds an optional
 target role ID to both rule tables and is applied automatically on startup.
 
-## Message context and storage
+## Discord message context and storage
 
 Jeeves stores messages from readable server channels, keeping the newest **500 per
 channel**. PostgreSQL triggers enforce retention, with indexes for guild/channel and
@@ -276,7 +403,7 @@ requests go to the configured Gemini backend. Provider-side retention is separat
 Jeeves' 500-message database limit. Rule processing and image work are not durably queued
 for replay after a restart.
 
-## JavaScript rules
+## Discord JavaScript rules
 
 Gemini generates code automatically for computational rules. Each script is a
 synchronous function taking one array and returning an allowed outcome. Message rules
@@ -345,6 +472,7 @@ cargo run --example typesafe
 | [`src/strikes.rs`](src/strikes.rs), [`src/strikes/`](src/strikes/) | Strike persistence, history, and admin controls. |
 | [`src/typesafe/`](src/typesafe/), [`src/message_actions/javascript.rs`](src/message_actions/javascript.rs) | Typed Jev client and bounded JavaScript execution. |
 | [`src/config.rs`](src/config.rs), [`src/db.rs`](src/db.rs) | Configuration, connection pool, and migrations. |
+| [`src/twitch/`](src/twitch/) | Twitch EventSub, chat commands, rules, strikes, and moderation API. |
 
 The gateway currently uses one shard.
 
@@ -419,8 +547,15 @@ gh workflow run ci.yml --repo Infrawrench/Jeeves --ref main
 `.env`, local Neon/provider state, and temporary cloud credentials are excluded from
 Git. The namespace, Kubernetes service account, and CI role binding are defined in
 [the bootstrap manifest](deploy/bootstrap.yaml) and provisioned separately from routine
-deployments. The bot needs outbound access to Discord, PostgreSQL, TypeSafe, and Google
-Cloud; it does not expose an HTTP service or ingress.
+deployments. The bot needs outbound access to Discord, Twitch, PostgreSQL, TypeSafe,
+and Google Cloud. Hosted Twitch setup also applies [the service and ingress](deploy/web.yaml),
+using the hostname from `PUBLIC_URL`, the existing `nginx` ingress class, and the
+`letsencrypt-prod` certificate issuer. Point that hostname's Cloudflare A record at
+the cluster ingress IP. Use DNS-only until the first TLS certificate is ready, then
+enable proxying if desired. The deployment script omits HTTP readiness checks for
+manual-token and Discord-only configurations. Ingress access logs are disabled so
+OAuth callback codes are not recorded. OAuth states expire after ten minutes and
+are bound to the initiating browser; after a pod restart, start authorization again.
 
 With cluster credentials configured, inspect the running deployment with:
 
