@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jeeves
+  namespace: jeeves
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  minReadySeconds: 60
+  progressDeadlineSeconds: 600
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: jeeves
+  template:
+    metadata:
+      labels:
+        app: jeeves
+    spec:
+      serviceAccountName: jeeves
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jeeves
+          image: jeeves:replaced-by-ci
+          envFrom:
+            - secretRef:
+                name: jeeves-env
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

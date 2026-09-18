@@ -327,19 +327,30 @@ These checks apply migrations and exercise retention, concurrent writes, image s
 strike escalation, duplicate prevention, pagination, and scoped removal. Discord and
 model calls are mocked; the checks do not issue live moderation actions.
 
-## GitHub Actions and IAM
+## Deployment and IAM
 
 [CI](.github/workflows/ci.yml) runs formatting, Clippy, unit tests, documentation tests,
 and PostgreSQL integration tests on pushes to `main` and pull requests. It uses Rust
 1.98.0 and a disposable PostgreSQL 17 service. Tests do not read production secrets.
 
-After checks pass on `main`, a separate job verifies Google Cloud authentication
-through [Workload Identity Federation](https://github.com/google-github-actions/auth).
+After checks pass on `main`, CI builds the [container](Dockerfile), pushes it to Artifact
+Registry, and deploys its immutable digest to the `jeeves` namespace in the existing
+`infrawrench-prod` GKE cluster in `us-east4`. Manual workflow runs on `main` do the same.
+Pull requests only run checks.
+
+Google Cloud authentication uses
+[Workload Identity Federation](https://github.com/google-github-actions/auth).
 Its IAM provider accepts only this repository's numeric repository/owner IDs and the
-`main` branch's CI workflow, for push or manual runs. Pull requests cannot use it.
-The `jeeves-ci` service account has no project resource roles; this job verifies
-authentication without running the bot or changing cloud resources. No service-account
-key is stored in GitHub.
+`main` branch's CI workflow, for push or manual runs. The `jeeves-ci` account can publish
+to Jeeves' Artifact Registry repository and discover the cluster. Kubernetes RBAC
+limits its deployment and runtime-secret access to the `jeeves` namespace. No
+service-account key is stored in GitHub.
+
+The pod uses a separate `jeeves-runtime` identity with Vertex AI access, linked to its
+Kubernetes service account through GKE Workload Identity. The
+[deployment](deploy/deployment.yaml) runs one non-root replica with a read-only root
+filesystem. `Recreate` stops the old bot before starting its replacement, so updates
+include a short disconnect. Main-branch deployment runs are serialized.
 
 The repository uses these Actions variables:
 
@@ -348,16 +359,34 @@ The repository uses these Actions variables:
 | `GCP_PROJECT_ID` | Google Cloud project hosting the CI identity. |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | Full Workload Identity Federation provider resource name. |
 | `GCP_SERVICE_ACCOUNT` | CI service account email. |
+| `AR_REGISTRY` | Artifact Registry repository URL, without the image name. |
+| `GKE_CLUSTER` | Target cluster name. |
+| `GKE_REGION` | Cluster and Artifact Registry region. |
 
 Runtime configuration from `.env` is stored as encrypted repository Actions secrets.
-To update those values with the GitHub CLI:
+[The deployment script](scripts/deploy.py) applies those values to the `jeeves-env`
+Kubernetes Secret over stdin, then updates the deployment and waits for its rollout.
+Secrets are excluded from the image build context and are never written into image
+layers. A configuration checksum triggers a restart when secret values change.
+To update runtime configuration and redeploy the current `main` commit:
 
 ```sh
 gh secret set --repo Infrawrench/Jeeves --env-file .env
+gh workflow run ci.yml --repo Infrawrench/Jeeves --ref main
 ```
 
 `.env`, local Neon/provider state, and temporary cloud credentials are excluded from
-Git. This workflow provides CI and IAM verification; it does not deploy a running bot.
+Git. The namespace, Kubernetes service account, and CI role binding are defined in
+[the bootstrap manifest](deploy/bootstrap.yaml) and provisioned separately from routine
+deployments. The bot needs outbound access to Discord, PostgreSQL, TypeSafe, and Google
+Cloud; it does not expose an HTTP service or ingress.
+
+With cluster credentials configured, inspect the running deployment with:
+
+```sh
+kubectl --namespace=jeeves get pods
+kubectl --namespace=jeeves logs deployment/jeeves --tail=50
+```
 
 ## License
 

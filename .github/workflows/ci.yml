@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,15 +68,70 @@ jobs:
           TEST_DATABASE_URL: postgres://jeeves:ci-only-password@localhost:5432/jeeves_test?sslmode=disable
         run: cargo test --locked --bin jeeves -- --ignored --test-threads=1
 
-  iam:
-    name: Google Cloud IAM
+  build:
+    name: Build and publish container
     needs: checks
     if: >-
       github.repository == 'Infrawrench/Jeeves' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    env:
+      IMAGE_REPOSITORY: ${{ vars.AR_REGISTRY }}/jeeves
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Authenticate through Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Log in to Artifact Registry
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          REGISTRY_HOST: ${{ vars.GKE_REGION }}-docker.pkg.dev
+        run: printf '%s' "$ACCESS_TOKEN" | docker login --username oauth2accesstoken --password-stdin "$REGISTRY_HOST"
+      - name: Build and push the commit image
+        id: image
+        run: |
+          docker buildx create --use --driver docker-container
+          docker buildx build --platform linux/amd64 --push \
+            --tag "$IMAGE_REPOSITORY:$GITHUB_SHA" \
+            --cache-from "type=registry,ref=$IMAGE_REPOSITORY:buildcache" \
+            --cache-to "type=registry,ref=$IMAGE_REPOSITORY:buildcache,mode=max" \
+            --metadata-file "$RUNNER_TEMP/jeeves-image.json" .
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          metadata = json.loads((Path(os.environ["RUNNER_TEMP"]) / "jeeves-image.json").read_text())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("digest=" + metadata["containerimage.digest"] + "\n")
+          PY
+
+  deploy:
+    name: Deploy Jeeves to GKE
+    needs: build
+    if: >-
+      github.repository == 'Infrawrench/Jeeves' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
@@ -91,9 +146,24 @@ jobs:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
-          access_token_lifetime: 300s
-          create_credentials_file: false
-          export_environment_variables: false
-      - name: Confirm authentication
-        run: echo "Google Cloud issued a short-lived access token to the Jeeves CI identity."
+      - name: Fetch cluster credentials
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_REGION }}
+      - name: Apply runtime secrets and deploy
+        env:
+          JEEVES_IMAGE: ${{ vars.AR_REGISTRY }}/jeeves@${{ needs.build.outputs.digest }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_MAX_CONNECTIONS: ${{ secrets.DATABASE_MAX_CONNECTIONS }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          TYPESAFE_MODEL: ${{ secrets.TYPESAFE_MODEL }}
+          GEMINI_BACKEND: ${{ secrets.GEMINI_BACKEND }}
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GOOGLE_CLOUD_PROJECT }}
+          GOOGLE_CLOUD_LOCATION: ${{ secrets.GOOGLE_CLOUD_LOCATION }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RUST_LOG: ${{ secrets.RUST_LOG }}
+        run: python3 scripts/deploy.py
