@@ -46,6 +46,8 @@ pub async fn serve(auth: Arc<Manager>, mut stop: watch::Receiver<bool>) -> Resul
 fn router(web: Web) -> Router {
     Router::new()
         .route("/", get(home))
+        .route("/favicon.png", get(favicon_png))
+        .route("/favicon.ico", get(favicon_ico))
         .route("/healthz", get(health))
         .route("/auth/twitch", get(start))
         .route("/auth/twitch/callback", get(callback))
@@ -59,6 +61,26 @@ fn router(web: Web) -> Router {
         .with_state(web)
 }
 
+async fn favicon_png() -> Response {
+    favicon("image/png", include_bytes!("assets/favicon.png"))
+}
+
+async fn favicon_ico() -> Response {
+    favicon("image/x-icon", include_bytes!("assets/favicon.ico"))
+}
+
+fn favicon(content_type: &'static str, bytes: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 async fn health(State(web): State<Web>) -> StatusCode {
     match sqlx::query("SELECT 1").execute(&web.auth.pool).await {
         Ok(_) => StatusCode::OK,
@@ -68,19 +90,63 @@ async fn health(State(web): State<Web>) -> StatusCode {
 
 async fn home(State(web): State<Web>) -> Response {
     let login = &web.auth.config.bot_login; // Configuration accepts only lowercase login characters.
+    // The hosted Jeeves application and permissions from the README's Discord invite.
+    let discord_invite = "https://discord.com/oauth2/authorize?client_id=1550283057125392566&amp;scope=bot%20applications.commands&amp;permissions=268512262&amp;integration_type=0";
     page(
         StatusCode::OK,
-        "Jeeves",
+        "Discord and Twitch moderation",
         &format!(
-            "<p class='eyebrow'>TWITCH MODERATION</p><h1>Your rules.<br>A calmer chat.</h1><p class='intro'>Tell Jeeves what belongs in your community. It handles messages, strikes, timeouts, and bans while you stream.</p><section><h2>Add Jeeves to your channel</h2><ol><li>In your own Twitch chat, make the bot a moderator:<code>/mod {login}</code></li><li>Open <a href='https://www.twitch.tv/{login}'>{login}’s chat</a> and send <code>!join</code></li><li>Back in your channel, add a rule in plain English:<code>!addaction Time out users for ten minutes for targeted harassment.</code></li></ol><p>Everything runs on our server. You don’t need to install anything or keep this page open.</p><p>To stop, send <code>!leave</code> in the bot’s chat. Your rules and strikes are kept if you rejoin.</p></section><section><h2>Rules that fit your community</h2><code>!addaction Strike users who post unsolicited advertising.</code><code>!addaction Ban users when they have at least five strikes.</code><p>Broadcasters and moderators can manage rules. Use <code>!jeeves help</code> in your channel to see the commands.</p></section><footer><p>Chat messages and rule descriptions are processed by our AI providers to apply your rules. Jeeves keeps recent chat history and persistent strikes.</p><a href='/auth/twitch'>Bot account setup</a><span> · Only for the operator of {login}</span></footer>"
+            r##"<p class="eyebrow">DISCORD &amp; TWITCH MODERATION</p>
+<h1>Your rules.<br>A calmer chat.</h1>
+<p class="intro">Moderation rules in plain English for your Discord server and Twitch channel. Jeeves keeps track of strikes and applies the actions you choose.</p>
+<nav class="actions" aria-label="Add Jeeves">
+  <a class="button" href="{discord_invite}">Invite to Discord</a>
+  <a class="button secondary" href="#twitch">Set up Twitch</a>
+</nav>
+<p>Everything runs on our server. You don’t need to install anything or keep this page open.</p>
+<section id="discord" aria-labelledby="discord-title">
+  <p class="section-label">DISCORD</p>
+  <h2 id="discord-title">Add Jeeves to your server</h2>
+  <p>Describe what belongs in your community, and let Jeeves evaluate messages and image attachments against your rules. Record strikes, kick or ban members, and give or revoke roles based on the conditions you set.</p>
+  <ol>
+    <li><a href="{discord_invite}">Invite Jeeves</a> and choose your Discord server.</li>
+    <li>Give Jeeves access to the channels you want it to moderate. Place its role above the members it should moderate and the roles it should manage.</li>
+    <li>As a server administrator, add a rule in plain English:
+      <code>/addaction question:Strike users who post unsolicited advertising.</code>
+      Add an escalation rule to choose what happens after repeated violations:
+      <code>/addaction question:Ban a user when they have at least five strikes.</code>
+    </li>
+  </ol>
+  <p>Use <code>/manageactions</code> to review or remove rules and <code>/managestrikes</code> to manage a member’s strikes. Members can privately check their own record with <code>/strikes</code>.</p>
+  <p>There are no default moderation rules or automatic strike penalties. Each Discord server and Twitch channel keeps its own rules and strikes.</p>
+</section>
+<section id="twitch" aria-labelledby="twitch-title">
+  <p class="section-label">TWITCH</p>
+  <h2 id="twitch-title">Add Jeeves to your channel</h2>
+  <p>Keep chat in line with message deletion, strikes, timeouts, and bans while you stream.</p>
+  <ol>
+    <li>In your own Twitch chat, make the bot a moderator:<code>/mod {login}</code></li>
+    <li>Open <a href="https://www.twitch.tv/{login}">{login}’s chat</a> and send <code>!join</code></li>
+    <li>Back in your channel, add a rule in plain English:<code>!addaction Time out users for ten minutes for targeted harassment.</code></li>
+  </ol>
+  <h3>Example Twitch rules</h3>
+  <code>!addaction Strike users who post unsolicited advertising.</code>
+  <code>!addaction Ban users when they have at least five strikes.</code>
+  <p>Broadcasters and moderators can manage rules. Use <code>!jeeves help</code> in your channel to see the commands.</p>
+  <p>To stop, send <code>!leave</code> in the bot’s chat. Your rules and strikes are kept if you rejoin.</p>
+</section>
+<footer>
+  <p>Chat messages, Discord image attachments, and rule descriptions are processed by our AI providers to apply your rules. Jeeves keeps recent chat history and persistent strikes.</p>
+  <a href="/auth/twitch">Twitch bot account setup</a><span> · Only for the operator of {login}</span>
+</footer>"##
         ),
     )
 }
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let html = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>{title} · Jeeves</title><style>
-:root{{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif;background:#111016;color:#eeeaf7}}*{{box-sizing:border-box}}body{{margin:0}}main{{max-width:800px;margin:auto;padding:72px 24px}}.brand{{font-size:20px;font-weight:750;color:#d9c8ff;text-decoration:none}}h1{{font-size:clamp(44px,8vw,76px);line-height:1.04;letter-spacing:-.05em;margin:28px 0}}h2{{font-size:24px;letter-spacing:-.02em}}p,li{{line-height:1.7;color:#cac4d5}}.eyebrow{{margin-top:56px;font-size:12px;letter-spacing:.18em;color:#bc9cff}}.intro{{font-size:20px;max-width:600px}}section{{border-top:1px solid #37313f;margin-top:42px;padding-top:24px}}li{{padding:8px 0}}a{{color:#c9acff}}code{{font-family:ui-monospace,monospace;font-size:14px;background:#26202f;padding:3px 7px;border-radius:5px;overflow-wrap:anywhere}}li>code,section>code{{display:block;margin:12px 0;padding:14px 16px}}footer{{margin-top:48px;font-size:13px;color:#91899e}}footer p{{color:#91899e}}
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>{title} · Jeeves</title><link rel="icon" type="image/png" sizes="64x64" href="/favicon.png"><link rel="icon" type="image/x-icon" sizes="16x16 32x32 48x48" href="/favicon.ico"><style>
+:root{{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif;background:#111016;color:#eeeaf7}}*{{box-sizing:border-box}}body{{margin:0}}main{{max-width:800px;margin:auto;padding:72px 24px}}.brand{{font-size:20px;font-weight:750;color:#d9c8ff;text-decoration:none}}h1{{font-size:clamp(44px,8vw,76px);line-height:1.04;letter-spacing:-.05em;margin:28px 0}}h2{{font-size:24px;letter-spacing:-.02em}}h3{{font-size:20px;margin-top:32px}}p,li{{line-height:1.7;color:#cac4d5}}.eyebrow,.section-label{{font-size:12px;letter-spacing:.18em;color:#bc9cff}}.eyebrow{{margin-top:56px}}.intro{{font-size:20px;max-width:600px}}.actions{{display:flex;flex-wrap:wrap;gap:12px;margin:28px 0}}.button{{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:12px 20px;border:1px solid #c9acff;border-radius:8px;background:#c9acff;color:#20152e;font-weight:700;text-decoration:none}}.button:hover{{background:#decaff;border-color:#decaff}}.button.secondary{{background:transparent;color:#c9acff;border-color:#645275}}.button.secondary:hover{{background:#26202f}}a:focus-visible{{outline:3px solid #f1e6ff;outline-offset:4px}}section{{border-top:1px solid #37313f;margin-top:42px;padding-top:24px;scroll-margin-top:24px}}li{{padding:8px 0}}a{{color:#c9acff}}code{{font-family:ui-monospace,monospace;font-size:14px;background:#26202f;padding:3px 7px;border-radius:5px;overflow-wrap:anywhere}}li>code,section>code{{display:block;margin:12px 0;padding:14px 16px}}footer{{margin-top:48px;font-size:13px;color:#91899e}}footer p{{color:#91899e}}
 </style></head><body><main><a class="brand" href="/">Jeeves</a>{body}</main></body></html>"#
     );
     let mut response = (status, Html(html)).into_response();
@@ -96,7 +162,7 @@ fn secure_headers(response: &mut Response) {
         "X-Content-Type-Options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("Content-Security-Policy", HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
+    headers.insert("Content-Security-Policy", HeaderValue::from_static("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
 }
 
 async fn start(State(web): State<Web>) -> Response {
