@@ -224,10 +224,24 @@ For each new message, Jeeves:
 3. Evaluates each rule in its own task while storing the message and image results.
 4. Records strikes, evaluates strike rules, and applies the combined moderation result.
 
-History is ordered oldest first and excludes the incoming message, which is passed
-separately to evaluators. Storage follows gateway order so later edits and deletes
-cannot overtake the original insert. Edits update stored context but do not rerun
-message rules. Jeeves skips moderation of its own messages.
+Jev message rules always receive the complete current message and its image results.
+Each rule gets as many whole previous messages as fit, **newest first**, stopping at
+the first message that would exceed the budget. Space is reserved for the full rule,
+its answer choices, JSON structure, and request framing.
+
+TypeSafe documents a [32k context limit for state plus the longest question](https://docs.typesafe.ai/models)
+but does not publish a tokenizer. Jeeves conservatively counts one potential token
+per serialized UTF-8 byte and reserves another 1,024 units for framing, within a
+32,000-unit budget. This includes Unicode, JSON escaping, image descriptions, and
+description errors; it generally uses less than the model's full token capacity.
+If the current message and rule alone exceed this estimate, they are sent intact
+without history and a warning is logged. A truly oversized current message can still
+exceed Jev's limit.
+
+JavaScript message rules receive the full retained history oldest first, followed by
+the current message. Storage follows gateway order so later edits and deletes cannot
+overtake the original insert. Edits update stored context but do not rerun message
+rules. Jeeves skips moderation of its own messages.
 
 Supported attachments are PNG, JPEG, WebP, HEIC, and HEIF, up to **12 MiB each**.
 Descriptions and errors are stored in `messages.images` as JSONB. Failed descriptions

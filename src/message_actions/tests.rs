@@ -321,6 +321,136 @@ async fn jev_failure_is_reported_without_discarding_other_action_results() -> Re
     Ok(())
 }
 
+#[test]
+fn jev_history_fits_exactly_and_reserves_each_question_and_json_overhead() -> Result<()> {
+    let input = context(&[]);
+    let mut context = ActionContext {
+        message: input.message,
+        images: input.images,
+        history: input.history,
+    };
+    context.message.content = "Current: 🦀\n\"quoted\" \\".into();
+    context.images[0].description = Some("Image: 日本語\n\"quoted\"".into());
+    let mut older = self::context(&[]).history.pop().unwrap();
+    older.id = 298;
+    older.images[0].description_error = Some("Unavailable: \"画像\"\n".into());
+    context.history.insert(0, older);
+    let rule = "Strike for \"spam\"\n日本語";
+    let question = moderation_question(rule)?;
+    let small = jev_state(&context, &question)?;
+    assert_eq!(small["history"].as_array().unwrap().len(), 2);
+    let remaining = JEV_CONTEXT_BUDGET
+        - JEV_CONTEXT_RESERVE
+        - question.json_size()?
+        - serde_json::to_vec(&small)?.len();
+    context.history[1].content.push_str(&"a".repeat(remaining));
+
+    let exact = jev_state(&context, &question)?;
+    assert_eq!(exact["history"][0]["id"], "299");
+    assert_eq!(exact["history"][1]["id"], "298");
+    assert_eq!(
+        serde_json::to_vec(&exact)?.len() + question.json_size()? + JEV_CONTEXT_RESERVE,
+        JEV_CONTEXT_BUDGET
+    );
+    assert_eq!(exact["current_message"]["content"], context.message.content);
+    assert_eq!(exact["current_message"]["images"], json!(context.images));
+
+    // The same message history fits differently for a longer rule.
+    let longer_question = moderation_question(&format!("{rule}!"))?;
+    assert_eq!(
+        jev_state(&context, &longer_question)?["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    context.history[1].content.push('a');
+    let over = jev_state(&context, &question)?;
+    assert_eq!(over["history"].as_array().unwrap().len(), 1);
+    assert_eq!(over["history"][0]["id"], "299");
+    assert_eq!(over["history"][0]["content"], context.history[1].content);
+    Ok(())
+}
+
+#[test]
+fn jev_preserves_oversized_current_message_and_images_without_history() -> Result<()> {
+    let input = context(&[]);
+    let mut context = ActionContext {
+        message: input.message,
+        images: input.images,
+        history: input.history,
+    };
+    context.message.content = "Current 🦀\n".repeat(4_000);
+    context.images[0].description = Some("Image text\n".repeat(4_000));
+    let question = moderation_question("Strike for spam")?;
+    let state = jev_state(&context, &question)?;
+    assert_eq!(state["current_message"]["id"], "300");
+    assert_eq!(state["current_message"]["content"], context.message.content);
+    assert_eq!(state["current_message"]["images"], json!(context.images));
+    assert_eq!(state["history"], json!([]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn jev_sends_recent_history_until_full_while_code_receives_all_messages() -> Result<()> {
+    let (jev, request) = jev_response(
+        200,
+        json!({
+            "model": "jev-test", "usage": {},
+            "answers": {"answer": {
+                "type": "score", "score": 3.0, "confidence": 1.0,
+                "legend": {"0": "ban", "1": "kick", "2": "strike", "3": "no action"},
+                "probabilities": {"0": 0.0, "1": 0.0, "2": 0.0, "3": 1.0},
+            }},
+        }),
+    )?;
+    let mut input = context(&[7, 3]);
+    input.actions[0].code = None;
+    input.actions[1].code = Some(
+        "messages => {
+            if (messages.length !== 11 || messages[0].id !== '290' ||
+                messages[9].id !== '299' || messages[10].id !== '300') {
+                throw new Error('Full chronological history is required');
+            }
+            return null;
+        }"
+        .into(),
+    );
+    input.history = (290..300)
+        .map(|id| {
+            let mut previous = context(&[]).history.pop().unwrap();
+            previous.id = id;
+            previous.content = match id {
+                297 => "too large".repeat(4_000),
+                298 | 299 => "🦀\n\"text\"\\".repeat(500),
+                _ => "small older message".into(),
+            };
+            previous
+        })
+        .collect();
+    let report = process_message(input, jev).await;
+    assert_eq!((report.succeeded(), report.failed()), (2, 0));
+    let request = request.join().unwrap();
+    let state = &request["state"];
+    assert_eq!(state["current_message"]["content"], "incoming");
+    assert_eq!(
+        state["current_message"]["images"][0]["description"],
+        "Incoming image text."
+    );
+    let history = state["history"].as_array().unwrap();
+    // Stop at the first non-fitting message; don't skip it to include older ones.
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["id"], "299");
+    assert_eq!(history[1]["id"], "298");
+    assert!(
+        serde_json::to_vec(state)?.len()
+            + serde_json::to_vec(&request["questions"]["answer"])?.len()
+            + JEV_CONTEXT_RESERVE
+            <= JEV_CONTEXT_BUDGET
+    );
+    Ok(())
+}
+
 pub(crate) fn jev_response(
     status: u16,
     body: Value,

@@ -168,6 +168,13 @@ impl<A> Question<A> {
             answer: PhantomData,
         }
     }
+
+    /// Compact JSON bytes, including instructions and criteria, not a token count.
+    pub(crate) fn json_size(&self) -> Result<usize> {
+        serde_json::to_vec(&self.wire)
+            .map(|bytes| bytes.len())
+            .map_err(Error::Encode)
+    }
 }
 
 impl Question<NoulAnswer> {
