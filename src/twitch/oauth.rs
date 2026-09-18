@@ -133,6 +133,7 @@ async fn home(State(web): State<Web>) -> Response {
   <code>!addaction Strike users who post unsolicited advertising.</code>
   <code>!addaction Ban users when they have at least five strikes.</code>
   <p>Broadcasters and moderators can manage rules. Use <code>!jeeves help</code> in your channel to see the commands.</p>
+  <p>Broadcasters and moderators can use <code>!managestrikes @username</code> to view a user’s strikes in the current channel. Results appear publicly in chat, with commands to see the next strike or remove one.</p>
   <p>To stop, send <code>!leave</code> in the bot’s chat. Your rules and strikes are kept if you rejoin.</p>
 </section>
 <footer>

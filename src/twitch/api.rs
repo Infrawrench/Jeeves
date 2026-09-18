@@ -202,6 +202,26 @@ impl Api {
         checked(response).await
     }
 
+    pub async fn user_id_for_login(&self, login: &str) -> Result<Option<String>> {
+        let response: Value = self
+            .request(Method::GET, "/users", &[("login", login)], None)
+            .await?
+            .json()
+            .await?;
+        response["data"]
+            .as_array()
+            .context("missing Twitch users")?
+            .first()
+            .map(|user| {
+                user["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .context("missing Twitch user ID")
+            })
+            .transpose()
+    }
+
     pub async fn moderates(&self, channel: &str) -> Result<bool> {
         let mut after = String::new();
         loop {

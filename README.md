@@ -203,7 +203,11 @@ even if Twitch rejects a deletion, timeout, ban, or notice.
 
 Anyone can use `!jeeves strikes` to view their own active strikes **publicly in chat**.
 `!jeeves strikes <after-id>` shows the next entry; `!jeeves rules <after-id>` similarly
-pages through rules. Moderators can remove a strike with `!jeeves forgive <strike-id>`;
+pages through rules. Broadcasters and moderators can use `!managestrikes @username`
+(also `!jeeves managestrikes @username`) to view another user's active strikes in the
+current channel, publicly in chat. The response includes commands for the next entry
+and removing the displayed strike. Use `!managestrikes @username <after-id>` to continue.
+Moderators can remove a strike with `!jeeves forgive <strike-id>`;
 it stops counting toward future thresholds without undoing earlier timeouts or bans.
 Removed strike sources remain recorded to prevent duplicate deliveries restoring them.
 `!jeeves help` lists commands. Viewer command responses are limited to one per channel

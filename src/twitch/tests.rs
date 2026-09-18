@@ -402,6 +402,123 @@ async fn addaction_classifies_extracts_saves_and_rejects_failed_rules() -> Resul
 }
 
 #[test]
+fn moderator_strike_commands_validate_user_and_cursor() {
+    assert!(parse("!managestrikesx @viewer").is_none());
+    for prefix in ["!managestrikes", "!jeeves managestrikes"] {
+        for (input, after) in [("@Some_User", 0), ("Some_User 12", 12)] {
+            let command = parse(&format!("{prefix} {input}")).unwrap().unwrap();
+            assert_eq!(
+                command,
+                Command::ManageStrikes {
+                    login: "some_user".into(),
+                    after
+                }
+            );
+            assert!(command.requires_moderator());
+        }
+        for input in [
+            "",
+            "@",
+            "@@viewer",
+            "bad-name",
+            "🦀",
+            "viewer -1",
+            "viewer 0",
+            "viewer 1 extra",
+            "viewer 9223372036854775808",
+            "abcdefghijklmnopqrstuvwxyz",
+        ] {
+            assert!(
+                parse(&format!("{prefix} {input}")).unwrap().is_err(),
+                "{input}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn strike_lookup_requires_moderator_before_user_lookup_or_database() -> Result<()> {
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://127.0.0.1:1/test")?;
+    let jev = typesafe::Client::builder("test-key")
+        .base_url("http://127.0.0.1:1")
+        .max_retries(0)
+        .build()?;
+    let gemini = crate::gemini::Gemini::for_test("http://127.0.0.1:1".into());
+    // The only permitted HTTP request is the denial sent back to chat.
+    let (base, requests) = server(vec![(200, json!({"data": [{"is_sent": true}]}))]);
+    commands::handle(
+        &pool,
+        &api::Api::for_test(base),
+        &jev,
+        &gemini,
+        &message(),
+        parse("!managestrikes @someone 10").unwrap(),
+    )
+    .await?;
+    let requests = requests.join().unwrap();
+    assert!(requests[0].path.starts_with("POST /chat/messages"));
+    assert!(
+        requests[0].body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Only this channel's broadcaster")
+    );
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn twitch_user_lookup_handles_missing_and_malformed_users() -> Result<()> {
+    let (base, requests) = server(vec![
+        (200, json!({"data": [{"id": "123", "login": "viewer"}]})),
+        (200, json!({"data": []})),
+        (200, json!({"data": [{}]})),
+    ]);
+    let api = api::Api::for_test(base);
+    assert_eq!(api.user_id_for_login("viewer").await?, Some("123".into()));
+    assert_eq!(api.user_id_for_login("missing").await?, None);
+    assert!(api.user_id_for_login("broken").await.is_err());
+    let requests = requests.join().unwrap();
+    assert_eq!(requests[0].path, "GET /users?login=viewer HTTP/1.1");
+    Ok(())
+}
+
+#[tokio::test]
+async fn moderator_strike_lookup_reports_unknown_user_without_database() -> Result<()> {
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://127.0.0.1:1/test")?;
+    let jev = typesafe::Client::builder("test-key")
+        .base_url("http://127.0.0.1:1")
+        .max_retries(0)
+        .build()?;
+    let gemini = crate::gemini::Gemini::for_test("http://127.0.0.1:1".into());
+    let (base, requests) = server(vec![
+        (200, json!({"data": []})),
+        (200, json!({"data": [{"is_sent": true}]})),
+    ]);
+    let mut moderator = message();
+    moderator.badges.push(Badge {
+        set_id: "moderator".into(),
+    });
+    commands::handle(
+        &pool,
+        &api::Api::for_test(base),
+        &jev,
+        &gemini,
+        &moderator,
+        parse("!managestrikes @Missing").unwrap(),
+    )
+    .await?;
+    let requests = requests.join().unwrap();
+    assert_eq!(requests[0].path, "GET /users?login=missing HTTP/1.1");
+    assert_eq!(
+        requests[1].body["message"],
+        "Twitch user @missing was not found."
+    );
+    pool.close().await;
+    Ok(())
+}
+
+#[test]
 fn commands_are_validated() {
     assert!(parse("hello !jeeves").is_none());
     assert!(parse("!jeevesx help").is_none());
@@ -462,6 +579,130 @@ fn commands_are_validated() {
     assert!(!Command::Strikes(0).requires_moderator());
     assert!(Command::Forgive(1).requires_moderator());
     assert!(Command::Remove(1).requires_moderator());
+}
+
+#[tokio::test]
+#[ignore = "requires disposable TEST_DATABASE_URL"]
+async fn moderator_strike_history_pages_and_removes_only_current_channel_records() -> Result<()> {
+    let pool = crate::db::connect(
+        crate::config::database_options(&std::env::var("TEST_DATABASE_URL")?)?,
+        5,
+    )
+    .await?;
+    let channel = format!("twitch-managestrikes-{}", std::process::id());
+    let other_channel = format!("{channel}-other");
+    let channels = vec![channel.clone(), other_channel.clone()];
+    sqlx::query("DELETE FROM twitch_strikes WHERE channel_id = ANY($1)")
+        .bind(&channels)
+        .execute(&pool)
+        .await?;
+    let long_reason = "🦀".repeat(1000);
+    let mut ids = Vec::new();
+    for (index, (scope, user, reason, removed)) in [
+        (channel.as_str(), "900", long_reason.as_str(), false),
+        (channel.as_str(), "900", "Second violation", false),
+        (
+            channel.as_str(),
+            "200",
+            "Other user's private record",
+            false,
+        ),
+        (
+            other_channel.as_str(),
+            "900",
+            "Other channel's record",
+            false,
+        ),
+        (channel.as_str(), "900", "Already forgiven", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO twitch_strikes (channel_id, user_id, reason, source_message_id, source_rule_id, removed_at)
+             VALUES ($1, $2, $3, $4, 1, CASE WHEN $5 THEN now() ELSE NULL END) RETURNING id"
+        ).bind(scope).bind(user).bind(reason).bind(format!("fixture-{index}")).bind(removed)
+            .fetch_one(&pool).await?;
+        ids.push(id);
+    }
+    let sent = json!({"data": [{"is_sent": true}]});
+    let user = json!({"data": [{"id": "900", "login": "target"}]});
+    let (base, requests) = server(vec![
+        (200, user.clone()),
+        (200, sent.clone()),
+        (200, user.clone()),
+        (200, sent.clone()),
+        (200, sent.clone()), // Viewer denied before lookup.
+        (200, sent.clone()), // Moderator removes the first strike.
+        (200, user),
+        (200, sent),
+    ]);
+    let api = api::Api::for_test(base);
+    let jev = typesafe::Client::builder("test-key")
+        .base_url("http://127.0.0.1:1")
+        .max_retries(0)
+        .build()?;
+    let gemini = crate::gemini::Gemini::for_test("http://127.0.0.1:1".into());
+    let mut viewer = message();
+    viewer.broadcaster_user_id = channel.clone();
+    for (text, moderator, broadcaster) in [
+        ("!managestrikes @Target".to_owned(), true, false),
+        (format!("!managestrikes @target {}", ids[0]), false, true),
+        (format!("!managestrikes @target {}", ids[0]), false, false),
+        (format!("!jeeves forgive {}", ids[0]), true, false),
+        ("!jeeves managestrikes target".to_owned(), true, false),
+    ] {
+        viewer.badges = if moderator {
+            vec![Badge {
+                set_id: "moderator".into(),
+            }]
+        } else {
+            vec![]
+        };
+        viewer.chatter_user_id = if broadcaster {
+            channel.clone()
+        } else {
+            "200".into()
+        };
+        commands::handle(&pool, &api, &jev, &gemini, &viewer, parse(&text).unwrap()).await?;
+    }
+    let requests = requests.join().unwrap();
+    let replies: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path.starts_with("POST /chat/messages"))
+        .map(|request| {
+            assert_eq!(request.body["broadcaster_id"], channel);
+            request.body["message"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(replies.len(), 5);
+    assert!(replies[0].starts_with(&format!("@target strikes #{}:", ids[0])));
+    assert!(replies[0].contains(&format!("Next: !managestrikes @target {}", ids[0])));
+    assert!(replies[0].ends_with(&format!("Remove: !jeeves forgive {}", ids[0])));
+    assert!(replies[1].contains("Second violation"));
+    assert!(!replies[1].contains("Next:"));
+    assert!(replies[2].contains("Only this channel's broadcaster"));
+    assert!(replies[3].contains(&format!("Removed strike {}", ids[0])));
+    assert!(replies[4].contains("Second violation"));
+    for reply in replies {
+        assert!(reply.chars().count() <= 500);
+        assert!(
+            !reply.contains("Other user's")
+                && !reply.contains("Other channel's")
+                && !reply.contains("Already forgiven")
+        );
+    }
+    assert_eq!(
+        store::strikes(&pool, &other_channel, "900", 0).await?.len(),
+        1
+    );
+    assert_eq!(store::strikes(&pool, &channel, "200", 0).await?.len(), 1);
+    sqlx::query("DELETE FROM twitch_strikes WHERE channel_id = ANY($1)")
+        .bind(&channels)
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
 }
 
 #[test]

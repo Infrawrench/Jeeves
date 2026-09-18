@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use super::{Action, ChatMessage, add_action, api::Api, store};
 use crate::gemini::{self, Gemini};
 
-const HELP: &str = "!addaction <rule in plain English> (also !jeeves addaction); !jeeves rules [after-id]; !jeeves remove <rule-id>; !jeeves strikes [after-id]; !jeeves forgive <strike-id>. Example: !addaction Ban users after three strikes. Rule management and forgiveness require moderator status. To stop Jeeves, send !leave in the bot account's chat.";
+const HELP: &str = "!addaction <rule in plain English> (also !jeeves addaction); !jeeves rules [after-id]; !jeeves remove <rule-id>; !jeeves strikes [after-id] (your strikes); !managestrikes @username [after-id]; !jeeves forgive <strike-id>. Rule management, viewing others' strikes, and forgiveness require moderator status. Strike lists appear publicly in chat. To stop Jeeves, send !leave in the bot account's chat.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -15,6 +15,7 @@ pub enum Command {
     Rules(i64),
     Remove(i64),
     Strikes(i64),
+    ManageStrikes { login: String, after: i64 },
     Forgive(i64),
     Help,
 }
@@ -23,6 +24,9 @@ pub fn parse(text: &str) -> Option<Result<Command, &'static str>> {
     let (prefix, rest) = word(text.trim());
     if prefix == "!addaction" {
         return Some(plain_rule(rest));
+    }
+    if prefix == "!managestrikes" {
+        return Some(manage_strikes(rest));
     }
     if prefix != "!jeeves" {
         return None;
@@ -61,11 +65,30 @@ fn parse_args(rest: &str) -> Result<Command, &'static str> {
         }
         "rules" => Ok(Command::Rules(cursor(rest)?)),
         "strikes" => Ok(Command::Strikes(cursor(rest)?)),
+        "managestrikes" => manage_strikes(rest),
         "remove" => Ok(Command::Remove(id(rest)?)),
         "forgive" => Ok(Command::Forgive(id(rest)?)),
         "help" | "" if rest.is_empty() => Ok(Command::Help),
         _ => Err(HELP),
     }
+}
+
+fn manage_strikes(text: &str) -> Result<Command, &'static str> {
+    let usage = "Use !managestrikes @username [after-id]. Strike lists appear publicly in chat.";
+    let (login, after) = word(text);
+    let login = login.strip_prefix('@').unwrap_or(login);
+    if login.is_empty()
+        || login.len() > 25
+        || !login
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Err(usage);
+    }
+    Ok(Command::ManageStrikes {
+        login: login.to_ascii_lowercase(),
+        after: cursor(after).map_err(|_| usage)?,
+    })
 }
 
 fn plain_rule(rule: &str) -> Result<Command, &'static str> {
@@ -203,7 +226,7 @@ pub async fn handle(
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            page("rules", &entries)
+            page("rules", &entries, "!jeeves rules")
         }
         Command::Remove(id) => {
             let removed = sqlx::query("DELETE FROM twitch_rules WHERE channel_id = $1 AND id = $2")
@@ -223,7 +246,23 @@ pub async fn handle(
             format!(
                 "@{} {}",
                 message.chatter_user_login,
-                page("strikes", &entries)
+                page("strikes", &entries, "!jeeves strikes")
+            )
+        }
+        Command::ManageStrikes { login, after } => {
+            let Some(user_id) = api.user_id_for_login(&login).await? else {
+                return api
+                    .say(channel, &format!("Twitch user @{login} was not found."))
+                    .await;
+            };
+            let entries = store::strikes(pool, channel, &user_id, after).await?;
+            let removal = entries
+                .first()
+                .map(|(id, _)| format!(" Remove: !jeeves forgive {id}"))
+                .unwrap_or_default();
+            format!(
+                "@{login} {}{removal}",
+                page("strikes", &entries, &format!("!managestrikes @{login}"))
             )
         }
         Command::Forgive(id) => {
@@ -238,7 +277,7 @@ pub async fn handle(
     api.say(channel, &response).await
 }
 
-fn page(kind: &str, entries: &[(i64, String)]) -> String {
+fn page(kind: &str, entries: &[(i64, String)], next_command: &str) -> String {
     if entries.is_empty() {
         return format!("No more {kind}.");
     }
@@ -246,7 +285,7 @@ fn page(kind: &str, entries: &[(i64, String)]) -> String {
     let (id, description) = &entries[0];
     let description: String = description.chars().take(300).collect();
     let next = if entries.len() > 1 {
-        format!(" Next: !jeeves {kind} {id}")
+        format!(" Next: {next_command} {id}")
     } else {
         String::new()
     };
